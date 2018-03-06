@@ -139,7 +139,7 @@ var volumeFragmentSource = `#version 300 es
     }
     else {
       float t = (radius - v) / radius;
-      return mix(0.05, 1.0, pow(t, 0.45));
+      return mix(0.05, 1.0, t);
     }
   }
 
@@ -147,13 +147,14 @@ var volumeFragmentSource = `#version 300 es
     vec4 result = vec4(0.0);
     vec3 direction = last - first;
     float tEnd = length(direction);
-    float tIncr = tEnd / nSamples;
+    // We are using sqrt(3) as the maximum possible length to keep a constant sample rate
+    float tIncr = 1.73205080757 / nSamples;
     direction = normalize(direction);
 
     float t = 0.0;
     while (t < tEnd) {
       vec3 samplePos = first + t * direction;
-      float value = sampleVolume(samplePos) / float(nSamples);
+      float value = sampleVolume(samplePos) * tIncr;
       result += vec4(value);
       t += tIncr;
     }
