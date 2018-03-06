@@ -1,0 +1,683 @@
+<html>
+
+<!-- Helper scripts -->
+<script type="text/javascript">
+// Signals an error to the user
+function postError(msg) {
+  alert(msg);
+  document.getElementById("error").innerHTML = msg;
+}
+
+// Posts information about the frametime to the DOM
+function postFrametime(frametime) {
+  document.getElementById("frametime").innerHTML = "Frametime: " + frametime + " ms";
+  document.getElementById("fps").innerHTML = "FPS: " + 1.0 / frametime;
+}
+
+// Returns a boolean whether the triangle should rotate
+function doRotate() {
+  var checkbox = document.getElementById("doRotate").checked;
+  var slider = document.getElementById("rotationSpeed").value != 0.0;
+  return checkbox && slider;
+}
+
+// Returns the rotatation speed at which the triangle should rotate
+function rotate() { return document.getElementById("rotationSpeed").value }
+
+function nSamples() { return document.getElementById("nSamples").value }
+
+function rendering() {
+  var radios = document.getElementsByName("rendering");
+
+  for (var i = 0, length = radios.length; i < length; i++) {
+    if (radios[i].checked) {
+      return radios[i].value;
+    }
+  }
+}
+
+function showRenderingOutput() { return rendering() == "rendering"; }
+function showEntryPoints() { return rendering() == "entry"; }
+function showExitPoints() { return rendering() == "exit"; }
+
+</script>
+
+<!-- Adding Brandon Jones and Colin MacKenzie IV's gl-matrix library that provides easy
+to use vector and matrix maths operations.  Source: https://github.com/toji/gl-matrix
+-->
+<script type="text/javascript" src="gl-matrix.js"></script>
+
+
+<!-- Main WebGL functions -->
+<script type="text/javascript">
+
+// OBS:  "#version 300 es" has to be the first token in the source, so
+//
+// var vertexSource = `
+// #version 300 es
+// 
+// would not work as there is a \n after `
+// 
+var vertexSource = `#version 300 es
+
+  // These variables will be set for each vertex that this shader program is executed on
+  in vec3 in_position;
+
+  // Specifies the varying variable that stores the position of the vertex.  The value of
+  // this variable will be interpolated in the fragment shader
+  out vec3 color;
+
+  // The model matrix specifies the transformation for the current 'object'
+  uniform mat4 modelMatrix;
+  // The view matrix specifies information about the location of the virtual camera
+  uniform mat4 viewMatrix;
+  // The projection matrix determines the projection and its parameters, such as field of view
+  uniform mat4 projectionMatrix;
+
+  void main() {
+    // gl_Position is a library-defined variable that needs to be set by the vertex shader
+    gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(in_position, 1.0);
+
+    color = in_position.xyz;
+  }
+`;
+
+var fragmentSource = `#version 300 es
+  in highp vec3 color;
+
+  out highp vec4 out_color;
+
+  void main() {
+    out_color = vec4(color, 1.0);
+  }
+`;
+
+
+var volumeVertexSource = `#version 300 es
+    vec2 positions[6] = vec2[](
+      vec2(-1.0, -1.0),
+      vec2( 1.0, -1.0),
+      vec2( 1.0,  1.0),
+
+      vec2(-1.0, -1.0),
+      vec2( 1.0,  1.0),
+      vec2(-1.0,  1.0)
+  );
+
+  void main() {
+    gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
+  }
+`;
+
+var volumeFragmentSource = `#version 300 es
+  precision highp float;
+
+  out vec4 out_color;
+
+  // Texture that stores the result of the first renderpass (-> entry points)
+  uniform sampler2D entryPoints;
+
+  // Texture that stores the result of the second renderpass (-> exit points)
+  uniform sampler2D exitPoints;
+
+  // Stepsize in the volume raycasting
+  uniform float nSamples;
+
+  // Size of the canvas to normalize the fragment coordinates which are in screen coordinates
+  uniform ivec2 canvasSize;
+
+  float sampleVolume(vec3 position) {
+    //
+    // Check if point is in sphere
+    //
+
+    // Slightly offset in the z direction
+    float radius = 0.35;
+    float v = sqrt(pow(position.x - 0.5, 2.0) + pow(position.y - 0.5, 2.2) + pow(position.z - 0.45, 2.0));
+    if (v > radius) {
+      return 0.05;
+    }
+    else {
+      float t = (radius - v) / radius;
+      return mix(0.05, 1.0, pow(t, 0.45));
+    }
+  }
+
+  vec4 traverseRay(vec3 first, vec3 last) {
+    vec4 result = vec4(0.0);
+    vec3 direction = last - first;
+    float tEnd = length(direction);
+    float tIncr = tEnd / nSamples;
+    direction = normalize(direction);
+
+    float t = 0.0;
+    while (t < tEnd) {
+      vec3 samplePos = first + t * direction;
+      float value = sampleVolume(samplePos) / float(nSamples);
+      result += vec4(value);
+      t += tIncr;
+    }
+
+    // result.a = 1.0;
+
+    return result;
+  }
+
+  void main() {
+    out_color = vec4(0.0, 0.0, 0.0, 1.0);
+
+    vec2 coords = gl_FragCoord.xy / vec2(canvasSize);
+    vec3 entry = texture(entryPoints, coords).rgb;
+    vec3 exit = texture(exitPoints, coords).rgb;
+
+    vec4 color = traverseRay(entry, exit);
+
+    out_color = mix(out_color, color, color.a);
+  }
+`;
+
+
+
+function loadShader(gl, type, source) {
+  // Create a shader of the specified type (Vertex or Fragment in this case)
+  var shader = gl.createShader(type);
+
+  // Set the source code of the shader
+  gl.shaderSource(shader, source);
+
+  // Compile the shader code
+  gl.compileShader(shader);
+
+  // Check for compile errors
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    postError("Failed to compile shader with error: " + gl.getShaderInfoLog(shader));
+    gl.deleteShader(shader);
+    return null;
+  }
+  else {
+    return shader;
+  }
+}
+
+
+// Function that renders the scene to screen
+function render(gl, program, buffers, attributeLocations, uniformLocations, parameters) {
+  //
+  //   Initial setup
+  //
+
+  // Set the clear color to black with full opaqueness
+  gl.clearColor(0.0, 0.0, 0.0, 1.0);
+
+  // Clear the color
+  gl.clear(gl.COLOR_BUFFER_BIT  | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.CULL_FACE);
+
+
+  //
+  //   Rendering setup
+  //
+
+  // We use the program that was created above
+  gl.useProgram(program);
+
+  //
+  // Buffers
+
+  // Bind the vertex buffer
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffers.position);
+  // Specifying the layout of the data in the buffer
+  gl.vertexAttribPointer(
+    attributeLocations.position,
+    3,                                          // Number of Components
+    gl.FLOAT,                                   // Type of data in the buffer
+    false,                                      // whether components should be normalized
+    0,                                          // stride between objects
+    0                                           // offset to value
+  );
+  // Every vertex attribute array that we are using has to be enabled before it can be used
+  gl.enableVertexAttribArray(attributeLocations.position);
+
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffers.element);
+
+
+
+  //
+  // Matrices
+
+  // The view and projection matrices are the same for all objects
+  // Create the view matrix
+  var viewMatrix = mat4.create();
+  // Moving the camera 4 units away from the focus
+  mat4.translate(viewMatrix, viewMatrix, [0.0, 0.0, -2.5]);
+  gl.uniformMatrix4fv(uniformLocations.viewMatrix, false, viewMatrix);
+
+  // Create the projection matrix
+  var projectionMatrix = mat4.create();
+  {
+    var fieldOfView = 45 * 2.0 * Math.PI / 360.0;   // 45 degrees in radians
+    var aspectRatio = gl.canvas.clientWidth / gl.canvas.clientHeight; // assuming > 1.0
+    var zNear = 0.1;  // Near clipping plane
+    var zFar = 100.0; // Far clipping plane
+
+    mat4.perspective(projectionMatrix, fieldOfView, aspectRatio, zNear, zFar);
+  }
+  gl.uniformMatrix4fv(uniformLocations.projectionMatrix, false, projectionMatrix);
+
+  // Create the model matrix
+  var modelMatrix = mat4.create();
+
+  mat4.rotate(modelMatrix, modelMatrix, parameters.rotation, [0, 1, 0]);
+  mat4.translate(modelMatrix, modelMatrix, [-0.5, -0.5, -0,5]);
+
+  gl.uniformMatrix4fv(uniformLocations.modelMatrix, false, modelMatrix);
+
+
+  // We want to draw 12 triangles with 3 vertices each
+  gl.drawElements(
+    gl.TRIANGLES,
+    12 * 3,             // Rendering 2 triangles per each of the 6 cube faces
+    gl.UNSIGNED_BYTE,   // storage type of the element array buffer
+    0                   // offset into the buffer
+  );
+
+  gl.disable(gl.CULL_FACE);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+}
+
+
+
+// Main function to be executed after the page has been loaded
+function main() {
+  // Get the canvas object from the main document
+  var canvas = document.querySelector("#glCanvas");
+
+  // Get a WebGL 2.0 context from the canvas
+  var gl = canvas.getContext("webgl2");
+
+  // WebGL 2 is not supported on many browsers yet
+  if (!gl) {
+    postError("Error initializing WebGL2 context");
+    return;
+  }
+
+
+  //
+  //   Initialize the shader program
+  //
+
+  // Create the vertex and fragment shader objects
+  var vertexShader = loadShader(gl, gl.VERTEX_SHADER, vertexSource);
+  var fragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
+
+  // If either of the shaders failed to compile, we bail out
+  if (!vertexShader || !fragmentShader) {
+    return;
+  }
+
+
+  // Create the ProgramObject
+  var program = gl.createProgram();
+  // Attach the vertex and fragment shaders to the program object
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  // Link the Program Object
+  gl.linkProgram(program);
+
+  // Check for linking errors
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    postError('Failed to initialize shader program with error: ' + gl.getProgramInfoLog(program));
+    gl.deleteProgram(program);
+    return;
+  }
+
+
+
+  //
+  // Create the shader program for the volume rendering
+  //
+  var volumeVertexShader = loadShader(gl, gl.VERTEX_SHADER, volumeVertexSource);
+  var volumeFragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, volumeFragmentSource);
+
+  if (!volumeVertexShader || !volumeFragmentShader) {
+    return;
+  }
+
+  var volumeProgram = gl.createProgram();
+  gl.attachShader(volumeProgram, volumeVertexShader);
+  gl.attachShader(volumeProgram, volumeFragmentShader);
+  gl.linkProgram(volumeProgram);
+
+  // Check for linking errors
+  if (!gl.getProgramParameter(volumeProgram, gl.LINK_STATUS)) {
+    postError('Failed to initialize shader program with error: ' + gl.getProgramInfoLog(volumeProgram));
+    gl.deleteProgram(volumeProgram);
+    return;
+  }
+
+  //
+  //   Create the buffers
+  //
+
+  // Create a vertex buffer object (VBO) storing the vertex positions
+  var positionBuffer = gl.createBuffer();
+
+  // Binding the buffer as the current array buffer to be modified
+  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+
+  // Specify the positions as a linear array
+  // 
+  // Building a d6
+  // 
+  //       6
+  //        o--------------o 5
+  //       /|             /|
+  //      / |            / |            y ^
+  //     /  |          4/  |              |  z
+  //  7 o---+----------o   |              | /
+  //    |   o----------+---o  2           |/
+  //    |  / 3         |  /               *---------> x
+  //    | /            | /
+  //    |/             |/
+  //    o--------------o  1
+  //    0
+  //    
+
+  var positions = [
+    0.0, 0.0, 0.0,
+    1.0, 0.0, 0.0,
+    1.0, 1.0, 0.0,
+    0.0, 1.0, 0.0,
+
+    1.0, 0.0, 1.0,
+    1.0, 1.0, 1.0,
+    0.0, 1.0, 1.0,
+    0.0, 0.0, 1.0
+  ];
+
+  // Copy the data into the vertex buffer on the GPU
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+
+
+
+  // Create an element array buffer to store the indices to vertices
+  var elementArrayBuffer = gl.createBuffer();
+  
+  // Binding the buffer as the current element array buffer to be modified
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, elementArrayBuffer);
+
+  var indices = [
+    // bottom
+    0, 3, 1,
+    3, 2, 1,
+
+    // right
+    1, 2, 4,
+    2, 5, 4,
+
+    // left
+    3, 0, 6,
+    0, 7, 6,
+
+    // front
+    0, 1, 7,
+    1, 4, 7,
+
+    // back
+    3, 6, 5,
+    5, 2, 3,
+
+    // top
+    4, 5, 7,
+    5, 6, 7
+  ];
+
+  // Copy the data into the vertex buffer on the GPU as 8-bit unsigned integers
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint8Array(indices), gl.STATIC_DRAW);
+  
+  // It's always a good idea to reset the current buffer
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+
+
+  //
+  //   Attribute locations
+  //
+
+  // Getting the location of the vertex attributes of the vertex shader
+  var positionAttributeLocation = gl.getAttribLocation(program, "in_position");
+
+
+
+  //
+  //   Uniform locations
+  //
+
+  // Getting the location of the uniforms of the shader program
+  var modelMatrixUniformLocation = gl.getUniformLocation(program, "modelMatrix");
+  var viewMatrixUniformLocation = gl.getUniformLocation(program, "viewMatrix");
+  var projectionMatrixUniformLocation = gl.getUniformLocation(program, "projectionMatrix");
+
+ 
+  var entryPointsUniformLocation = gl.getUniformLocation(volumeProgram, "entryPoints");
+  var exitPointsUniformLocation = gl.getUniformLocation(volumeProgram, "exitPoints");
+  var canvasSizeLocation = gl.getUniformLocation(volumeProgram, "canvasSize")
+  var nSamplesUniformLocation = gl.getUniformLocation(volumeProgram, "nSamples");
+
+
+  //
+  //   Loading assets
+  //
+
+
+  //
+  //   Framebuffer textures
+  //
+  var entryTargetTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, entryTargetTexture);
+
+  gl.texImage2D(
+    gl.TEXTURE_2D,    // texture type
+    0,                // level
+    gl.RGBA,          // internal format
+    canvas.width,     // texture width
+    canvas.height,    // texture height
+    0,                // border
+    gl.RGBA,          // format
+    gl.UNSIGNED_BYTE, // type
+    null              // data
+  );
+
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  var entryFramebuffer = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, entryFramebuffer);
+  gl.framebufferTexture2D(
+    gl.FRAMEBUFFER,
+    gl.COLOR_ATTACHMENT0,   // attachment position in the framebuffer
+    gl.TEXTURE_2D,          // texture type
+    entryTargetTexture,     // target texture
+    0                       // level
+  );
+
+
+
+
+  var exitTargetTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, exitTargetTexture);
+
+  gl.texImage2D(
+    gl.TEXTURE_2D,    // texture type
+    0,                // level
+    gl.RGBA,          // internal format
+    canvas.width,     // texture width
+    canvas.height,    // texture height
+    0,                // border
+    gl.RGBA,          // format
+    gl.UNSIGNED_BYTE, // type
+    null              // data
+  );
+
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  var exitFramebuffer = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, exitFramebuffer);
+  gl.framebufferTexture2D(
+    gl.FRAMEBUFFER,
+    gl.COLOR_ATTACHMENT0,   // attachment position in the framebuffer
+    gl.TEXTURE_2D,          // texture type
+    exitTargetTexture,      // target texture
+    0                       // level
+  );
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+
+
+  //
+  //   Rendering
+  //
+
+  // Used to compute the delta time (dt) between frames
+  var then = 0;
+
+  // If doRotate is selected, this stores the full rotation value
+  var fullRotation = 0;
+  function internalRender(now) {
+    // Moving from ms to seconds
+    now *= 0.001;
+
+    // How much time has passed since the last update?
+    var dt = now - then;
+    then = now;
+
+    // If we rotate, we add the current time to the full rotation
+    if (doRotate()) {
+      fullRotation += dt * rotate();
+    }
+
+    // For Krüger-Westerman proxy geometry rendering, we need to render the cube twice and
+    // then resolve the volume rendering in a third pass
+
+    function shortRender(doRaycast) {
+      render(
+        gl,
+        program,
+        {
+          position: positionBuffer,
+          element: elementArrayBuffer
+        },
+        {
+          position: positionAttributeLocation,
+        },
+        {
+          modelMatrix: modelMatrixUniformLocation,
+          viewMatrix: viewMatrixUniformLocation,
+          projectionMatrix: projectionMatrixUniformLocation
+        },
+        { 
+          rotation: fullRotation
+        }
+      );
+    }
+
+
+    // Depending on the choice of radio buttons, we will redirect the rendering to various
+    // framebuffers. The 'null' one is always the one that will be rendered to
+    var localEntry = entryFramebuffer;
+    var localExit = exitFramebuffer;
+    var localRendering = null;
+
+    if (showRenderingOutput()) {
+      // nothing happens
+    }
+    else if (showEntryPoints()) {
+      localEntry = null;
+      localRendering = entryFramebuffer;
+    }
+    else if (showExitPoints()) {
+      localExit = null;
+      localRendering = exitFramebuffer;
+    }
+
+    //
+    // Render the entry points
+    //
+    gl.bindFramebuffer(gl.FRAMEBUFFER, localEntry);
+    gl.cullFace(gl.BACK);
+    shortRender(false);
+
+
+    //
+    // Render the exit points
+    // 
+    gl.bindFramebuffer(gl.FRAMEBUFFER, localExit);
+    gl.cullFace(gl.FRONT);
+    shortRender(true);
+
+
+    //
+    // Render a screen0aligned quad that performs the volume raycasting
+    //
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, localRendering);
+    gl.useProgram(volumeProgram);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, entryTargetTexture);
+    gl.uniform1i(entryPointsUniformLocation, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, exitTargetTexture);
+    gl.uniform1i(exitPointsUniformLocation, 1);
+
+    gl.uniform2i(canvasSizeLocation, canvas.width, canvas.height);
+
+    gl.uniform1f(nSamplesUniformLocation, nSamples());
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    gl.disable(gl.BLEND);
+
+
+    postFrametime(dt);
+
+    // By requesting the next animation frame, we are effectively looping inside internalRender
+    requestAnimationFrame(internalRender);
+  }
+
+  // Request the first frame, thus starting the render loop
+  requestAnimationFrame(internalRender);
+}
+
+</script>
+
+
+
+<body onload="main();">
+  <p>Volume Rendering using a simple procedurally generated volume</p>
+  <p id="error"></p>
+  <canvas id="glCanvas" width="640" height="480"></canvas>
+  <p id="frametime"></p>
+  <p id="fps"></p>
+  <input type="checkbox" id="doRotate" checked>Rotation
+  <input type="range" min="0" max="10" value="0" class="slider" id="rotationSpeed">
+  <br />
+  Number of Samples: <input type="range" min="1" max="1500" value="50" class="slider" id="nSamples">
+  <p>
+    <form>
+    <input type="radio" name="rendering" value="rendering" checked>Rendering
+    <input type="radio" name="rendering" value="entry">Entry Points
+    <input type="radio" name="rendering" value="exit">Exit Points
+    </form>
+
+  </p>
+</body>
+
+</html>
